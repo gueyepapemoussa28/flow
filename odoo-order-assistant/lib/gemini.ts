@@ -75,7 +75,7 @@ export async function callGemini(userMessage: string, previousDraft: Draft | nul
     console.error("[gemini] GEMINI_API_KEY manquante");
     throw new AppError("L'analyse des messages n'est pas configurée.", "gemini_config", 500);
   }
-  const model = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+  const model = process.env.GEMINI_MODEL?.trim() || "gemini-3.6-flash";
 
   const text =
     previousDraft && (previousDraft.customerQuery || previousDraft.lines.length > 0)
