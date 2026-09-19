@@ -63,9 +63,10 @@ async function odooCall<T>(model: string, method: string, params: Record<string,
   }
 
   if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as Row | null;
-    // Journal serveur (Vercel Logs) pour le diagnostic ; jamais renvoyé au navigateur.
-    console.error(`[odoo] ${model}.${method} → HTTP ${res.status}`, body?.name ?? "", body?.message ?? "");
+    // `text()` conserve la réponse telle qu'Odoo l'a envoyée, qu'elle soit JSON ou texte.
+    // Journal serveur temporaire de diagnostic ; ne jamais inclure l'en-tête Authorization.
+    const body = await res.text();
+    console.error(`[odoo] ${model}.${method} → HTTP ${res.status} — réponse complète :`, body);
 
     if (res.status === 401) throw new AppError("La clé API Odoo est invalide ou expirée.", "odoo_auth", 502);
     if (res.status === 403) throw new AppError("Le compte Odoo n'a pas les droits nécessaires pour cette opération.", "odoo_forbidden", 502);
