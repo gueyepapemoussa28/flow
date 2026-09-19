@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+/* Palette : papier bleuté, encre marine, un bleu pour l'utilisateur, un vert pour "confirmer". */
+@theme {
+  --color-paper: #eef1f5;
+  --color-ink: #0f1b2d;
+  --color-muted: #5b6779;
+  --color-rule: #d3d9e2;
+  --color-mine: #2447d6;
+  --color-go: #0e7c4a;
+  --color-alert: #b3261e;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Chiffres alignés (quantités et montants) */
+.num {
+  font-variant-numeric: tabular-nums;
+}
