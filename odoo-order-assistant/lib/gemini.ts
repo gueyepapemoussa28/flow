@@ -9,6 +9,30 @@ import { AppError } from "./errors";
 import type { Draft } from "@/types/order";
 
 const TIMEOUT_MS = 20_000;
+const RETRY_DELAYS_MS = [2_000, 5_000] as const;
+
+/** Attend entre deux tentatives, tout en respectant le timeout global de l'appel. */
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, delayMs);
+
+    function done() {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    }
+
+    function aborted() {
+      clearTimeout(timer);
+      reject(new DOMException("L'appel Gemini a expiré.", "AbortError"));
+    }
+
+    if (signal.aborted) {
+      aborted();
+      return;
+    }
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+}
 
 export const SYSTEM_PROMPT = `Tu es un parseur de commandes commerciales.
 
@@ -85,23 +109,31 @@ export async function callGemini(userMessage: string, previousDraft: Draft | nul
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  let res: Response;
+  let res: Response | null = null;
   try {
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [{ role: "user", parts: [{ text }] }],
-        generationConfig: {
-          temperature: 0,
-          responseMimeType: "application/json",
-          responseSchema: RESPONSE_SCHEMA,
-        },
-      }),
-      signal: controller.signal,
-      cache: "no-store",
-    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [{ role: "user", parts: [{ text }] }],
+          generationConfig: {
+            temperature: 0,
+            responseMimeType: "application/json",
+            responseSchema: RESPONSE_SCHEMA,
+          },
+        }),
+        signal: controller.signal,
+        cache: "no-store",
+      });
+
+      if (res.status !== 503 || attempt === RETRY_DELAYS_MS.length) break;
+
+      const delayMs = RETRY_DELAYS_MS[attempt];
+      console.warn(`[gemini] HTTP 503 ; tentative ${attempt + 2}/3 dans ${delayMs / 1_000} s`);
+      await waitForRetry(delayMs, controller.signal);
+    }
   } catch (e) {
     const timedOut = e instanceof Error && e.name === "AbortError";
     console.error("[gemini] appel échoué :", timedOut ? "timeout" : "réseau");
@@ -112,6 +144,11 @@ export async function callGemini(userMessage: string, previousDraft: Draft | nul
     );
   } finally {
     clearTimeout(timer);
+  }
+
+  // `res` est toujours défini après une tentative qui n'a pas levé d'exception.
+  if (!res) {
+    throw new AppError("Le service d'analyse est indisponible pour le moment.", "gemini_error", 502);
   }
 
   if (!res.ok) {
