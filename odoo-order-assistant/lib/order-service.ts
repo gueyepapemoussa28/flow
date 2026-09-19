@@ -152,8 +152,11 @@ export async function resolveDraft(input: Draft): Promise<ChatResponse> {
   const customer = customerStep.value;
   draft.customerId = customer.id;
 
-  // 3. Produits (en parallèle)
-  const productSteps = await Promise.all(draft.lines.map((line, i) => resolveProduct(line, i, draft)));
+  // 3. Produits (un par un pour éviter un pic de requêtes vers Odoo)
+  const productSteps: Step<Product>[] = [];
+  for (let i = 0; i < draft.lines.length; i++) {
+    productSteps.push(await resolveProduct(draft.lines[i], i, draft));
+  }
   productSteps.forEach((step, i) => {
     if (step.ok) draft.lines[i].productId = step.value.id; // on garde les choix déjà faits
   });
@@ -163,8 +166,11 @@ export async function resolveDraft(input: Draft): Promise<ChatResponse> {
     products.push(step.value);
   }
 
-  // 4. Unités de mesure
-  const uomSteps = await Promise.all(draft.lines.map((line, i) => resolveUom(line, products[i], draft)));
+  // 4. Unités de mesure (un appel Odoo à la fois)
+  const uomSteps: Step<Uom | null>[] = [];
+  for (let i = 0; i < draft.lines.length; i++) {
+    uomSteps.push(await resolveUom(draft.lines[i], products[i], draft));
+  }
   const uoms: (Uom | null)[] = [];
   for (const step of uomSteps) {
     if (!step.ok) return step.response;
