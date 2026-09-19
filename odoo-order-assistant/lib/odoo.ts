@@ -168,7 +168,7 @@ export async function getCustomerById(id: number): Promise<Customer | null> {
 export async function searchProduct(query: string): Promise<Product[]> {
   const p = cfg.product;
   const domain = [...p.extraDomain, ...buildNameDomain(p.searchFields, query)];
-  const rows = await searchRead(p.model, domain, p.fields, cfg.searchLimit, "display_name asc");
+  const rows = await searchRead(p.model, domain, p.fields, cfg.searchLimit, "name asc");
   return rows.map(toProduct);
 }
 
