@@ -35,13 +35,13 @@ export default function OrderPreview({ order, status, onConfirm, onCancel }: Pro
             <div className="min-w-0 text-[15px] leading-snug">
               <p>
                 <span className="num font-semibold">{formatQty(l.quantity)} ×</span> {l.productName}
-                {l.uomName && <span className="text-muted"> ({l.uomName})</span>}
+                {l.packagingName && <span className="text-muted"> — {l.packagingName}</span>}
               </p>
-              {l.unitPrice !== null && (
-                <p className="num text-sm text-muted">
-                  {formatMoney(l.unitPrice, order.currency)} / {l.uomName ?? "unité"}
-                </p>
-              )}
+              {/* Ce qui part réellement dans Odoo : toujours visible avant de confirmer. */}
+              <p className="num text-sm text-muted">
+                soit {formatQty(l.baseQuantity)} {l.uomName ?? "unité"}
+                {l.unitPrice !== null && <> · {formatMoney(l.unitPrice, order.currency)} / {l.uomName ?? "unité"}</>}
+              </p>
             </div>
             <p className="num shrink-0 text-right text-[15px]">
               {l.subtotal !== null ? formatMoney(l.subtotal, order.currency) : <span className="text-sm text-muted">Prix calculé par Odoo</span>}

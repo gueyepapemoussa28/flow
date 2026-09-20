@@ -1,4 +1,4 @@
-import type { Candidate, Draft, Order } from "./order";
+import type { Candidate, Draft, Order, SelectionKind } from "./order";
 
 /** Messages affichés dans la conversation (état purement frontend). */
 export type OrderStatus = "pending" | "confirming" | "created" | "cancelled" | "replaced";
@@ -11,7 +11,7 @@ export type UiMessage =
       role: "assistant";
       kind: "selection";
       text: string;
-      selectionKind: "customer" | "product";
+      selectionKind: SelectionKind;
       lineIndex?: number;
       candidates: Candidate[];
       draft: Draft; // brouillon au moment de la question

@@ -5,7 +5,7 @@
  * On ne recopie que les champs connus et on vérifie leur type.
  */
 import { AppError } from "./errors";
-import type { Draft, DraftLine, Intent, OrderRequest, ParsedLine, ParsedMessage } from "@/types/order";
+import type { Draft, DraftLine, Intent, OrderRequest, ParsedLine, ParsedMessage, SelectionKind } from "@/types/order";
 
 export const LIMITS = {
   maxMessageLength: 1000,
@@ -82,6 +82,7 @@ export function sanitizeDraft(raw: unknown): Draft | null {
         quantity: cleanQuantity(l.quantity),
         uomQuery: cleanText(l.uomQuery),
         productId: isId(l.productId) ? l.productId : undefined,
+        packagingId: isId(l.packagingId) ? l.packagingId : undefined,
       });
     }
   }
@@ -93,22 +94,28 @@ export function sanitizeDraft(raw: unknown): Draft | null {
 }
 
 export interface Selection {
-  kind: "customer" | "product";
+  kind: SelectionKind;
   id: number;
   lineIndex?: number;
 }
 
+const SELECTION_KINDS: SelectionKind[] = ["customer", "product", "packaging"];
+
 export function sanitizeSelection(raw: unknown): Selection | null {
   if (!isRecord(raw)) return null;
-  if (raw.kind !== "customer" && raw.kind !== "product") return null;
+  if (!SELECTION_KINDS.includes(raw.kind as SelectionKind)) return null;
   if (!isId(raw.id)) return null;
   const lineIndex = typeof raw.lineIndex === "number" && Number.isInteger(raw.lineIndex) ? raw.lineIndex : undefined;
-  return { kind: raw.kind, id: raw.id, lineIndex };
+  return { kind: raw.kind as SelectionKind, id: raw.id, lineIndex };
 }
 
 /**
  * Commande envoyée pour confirmation. On ne garde QUE les IDs et les quantités :
  * noms et prix envoyés par le navigateur sont ignorés (recalculés depuis Odoo).
+ *
+ * `quantity` est le nombre de CONDITIONNEMENTS quand packagingId est fourni
+ * (2 bacs), sinon une quantité dans l'unité de base. La conversion en unité de
+ * base est refaite côté serveur depuis la fiche Odoo du conditionnement.
  */
 export function sanitizeOrderRequest(raw: unknown): OrderRequest {
   const invalid = new AppError("La commande est invalide. Recommencez votre demande.", "invalid_order");
@@ -125,7 +132,12 @@ export function sanitizeOrderRequest(raw: unknown): OrderRequest {
     if (typeof l.quantity !== "number" || !Number.isFinite(l.quantity) || !isValidQuantity(l.quantity)) {
       throw new AppError("Une quantité est invalide (elle doit être supérieure à zéro).", "invalid_quantity");
     }
-    return { productId: l.productId, quantity: l.quantity, uomId: isId(l.uomId) ? l.uomId : null };
+    return {
+      productId: l.productId,
+      quantity: l.quantity,
+      uomId: isId(l.uomId) ? l.uomId : null,
+      packagingId: isId(l.packagingId) ? l.packagingId : null,
+    };
   });
 
   return { customerId: customer.id, lines };

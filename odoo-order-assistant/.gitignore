@@ -1,0 +1,17 @@
+# dépendances
+node_modules/
+
+# build Next.js
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# variables d'environnement (clés API : ne JAMAIS committer)
+.env
+.env.local
+.env*.local
+
+# divers
+.DS_Store
+*.log

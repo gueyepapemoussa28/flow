@@ -147,7 +147,9 @@ export default function Chat() {
     setMessages((all) =>
       all.map((m) => (m.id === message.id && m.role === "assistant" && m.kind === "selection" ? { ...m, answered: true, chosenId: id } : m))
     );
-    addUser(`${message.selectionKind === "customer" ? "Client" : "Produit"} : ${label}`);
+    const what =
+      message.selectionKind === "customer" ? "Client" : message.selectionKind === "product" ? "Produit" : "Conditionnement";
+    addUser(`${what} : ${label}`);
     void callChat({
       draft: message.draft,
       selection: { kind: message.selectionKind, lineIndex: message.lineIndex, id },
@@ -166,10 +168,16 @@ export default function Chat() {
     if (!pending) return;
     setPreviewStatus(pending.id, "confirming"); // bloque le double clic
 
-    // On n'envoie que des IDs et des quantités : le serveur revalide tout auprès d'Odoo.
+    // On n'envoie que des IDs et des quantités : le serveur revalide tout auprès d'Odoo
+    // et recalcule lui-même la conversion conditionnement → unité de base.
     const order = {
       customer: { id: pending.order.customer.id },
-      lines: pending.order.lines.map((l) => ({ productId: l.productId, quantity: l.quantity, uomId: l.uomId })),
+      lines: pending.order.lines.map((l) => ({
+        productId: l.productId,
+        quantity: l.quantity,
+        uomId: l.uomId,
+        packagingId: l.packagingId,
+      })),
     };
 
     try {

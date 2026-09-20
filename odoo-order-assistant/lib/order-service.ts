@@ -3,24 +3,30 @@
  *
  * Flux d'un message de commande :
  *   1. parseMessage()      → Gemini comprend le texte (1 appel)
- *   2. resolveDraft()      → le serveur retrouve client / produits / unités dans Odoo
- *                            (aucune IA ici) et pose des questions s'il y a un doute
+ *   2. resolveDraft()      → le serveur retrouve client / produits / conditionnements
+ *                            dans Odoo (aucune IA ici) et pose des questions s'il y a un doute
  *   3. order_preview       → l'utilisateur voit le récapitulatif
  *   4. confirmOrder()      → revalidation complète auprès d'Odoo, PUIS création
+ *
+ * Coût Odoo : les lectures par ID sont groupées. Une commande de N lignes déjà
+ * résolue coûte 3 appels (client + produits + conditionnements), pas 2N+1.
  */
-import { odooConfig as cfg } from "./odoo-config";
+import { odooConfig as cfg, type NewOrderLine } from "./odoo-config";
 import {
   createSalesOrder,
   getCustomerById,
-  getProductById,
-  getUomById,
+  getPackagingsByIds,
+  getPackagingsForProducts,
+  getProductsByIds,
+  getUomsByIds,
   searchCustomer,
   searchProduct,
   searchUom,
 } from "./odoo";
 import { AppError } from "./errors";
-import { formatMoney } from "./format";
+import { formatMoney, formatQty } from "./format";
 import { mergeIntoDraft, parseMessage } from "./order-parser";
+import { matchesAllWords, singular } from "./text";
 import {
   isRecord,
   isValidQuantity,
@@ -36,6 +42,7 @@ import type {
   Draft,
   DraftLine,
   Order,
+  Packaging,
   Product,
   Uom,
 } from "@/types/order";
@@ -61,11 +68,27 @@ function pickOne<T extends { name: string }>(items: T[], query: string): T | nul
 
 /** "Cartons" → "carton" (minuscules, sans "s" final). */
 function normalizeUom(text: string): string {
-  const t = text.trim().toLowerCase();
-  return t.length > 3 && t.endsWith("s") ? t.slice(0, -1) : t;
+  return singular(text.trim().toLowerCase());
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+const roundQty = (n: number) => Math.round(n * 1000) / 1000;
+
+/** Unité de base du produit ("kg"), telle que stockée dans Odoo. */
+const baseUomOf = (product: Product): Uom | null =>
+  product.uomId != null ? { id: product.uomId, name: product.uomName ?? "" } : null;
+
+/** Ce qui part réellement dans Odoo pour une ligne résolue. */
+interface ResolvedLine {
+  product: Product;
+  /** Quantité telle que saisie : nombre de conditionnements, ou quantité de base. */
+  quantity: number;
+  packaging: Packaging | null;
+  uom: Uom | null;
+}
+
+const baseQuantityOf = (line: ResolvedLine): number =>
+  roundQty(line.packaging ? line.quantity * line.packaging.qty : line.quantity);
 
 // ─────────────────────────────────────────────────────────────────────
 // POST /api/chat
@@ -75,7 +98,7 @@ export async function handleChat(body: unknown): Promise<ChatResponse> {
   const input = isRecord(body) ? body : {};
   const draft = sanitizeDraft(input.draft);
 
-  // Cas A : l'utilisateur a cliqué sur un choix dans une liste (client ou produit)
+  // Cas A : l'utilisateur a cliqué sur un choix dans une liste
   const selection = sanitizeSelection(input.selection);
   if (selection) {
     if (!draft) return { type: "error", message: "La conversation a expiré. Recommencez votre commande." };
@@ -84,7 +107,12 @@ export async function handleChat(body: unknown): Promise<ChatResponse> {
     } else {
       const line = selection.lineIndex !== undefined ? draft.lines[selection.lineIndex] : undefined;
       if (!line) return { type: "error", message: "Ce choix ne correspond à aucune ligne de la commande." };
-      line.productId = selection.id;
+      if (selection.kind === "product") {
+        line.productId = selection.id;
+        line.packagingId = undefined; // changer de produit invalide le conditionnement choisi
+      } else {
+        line.packagingId = selection.id;
+      }
     }
     return resolveDraft(draft); // l'ID choisi sera revérifié auprès d'Odoo
   }
@@ -115,7 +143,7 @@ export async function handleChat(body: unknown): Promise<ChatResponse> {
         type: "text",
         message:
           parsed.clarification ??
-          "Je n'ai pas compris votre demande. Exemple : « Crée une commande pour ABC SARL avec 10 cartons de Coca 33cl et 5 cartons de Fanta »",
+          "Je n'ai pas compris votre demande. Exemple : « Crée une commande pour ABC SARL avec 2 bacs de vanille et 1 de chocolat »",
       };
   }
 }
@@ -152,42 +180,26 @@ export async function resolveDraft(input: Draft): Promise<ChatResponse> {
   const customer = customerStep.value;
   draft.customerId = customer.id;
 
-  // 3. Produits (un par un pour éviter un pic de requêtes vers Odoo)
-  const productSteps: Step<Product>[] = [];
+  // 3. Produits — un seul appel groupé pour tous les choix déjà faits,
+  //    puis une recherche par ligne encore non résolue.
+  const productsStep = await resolveProducts(draft);
+  if (!productsStep.ok) return productsStep.response;
+  const products = productsStep.value;
+
+  // 4. Conditionnements — UN appel pour toutes les lignes.
+  const packagings = await getPackagingsForProducts(products.map((p) => p.id));
+
+  // 5. Conditionnement / unité de chaque ligne (aucun appel, sauf repli uom.uom)
+  const resolved: ResolvedLine[] = [];
   for (let i = 0; i < draft.lines.length; i++) {
-    productSteps.push(await resolveProduct(draft.lines[i], i, draft));
-  }
-  productSteps.forEach((step, i) => {
-    if (step.ok) draft.lines[i].productId = step.value.id; // on garde les choix déjà faits
-  });
-  const products: Product[] = [];
-  for (const step of productSteps) {
+    const line = draft.lines[i];
+    const product = products[i];
+    const step = await resolveUnit(line, i, product, packagings.get(product.id) ?? [], draft);
     if (!step.ok) return step.response;
-    products.push(step.value);
+    resolved.push({ product, quantity: line.quantity as number, ...step.value });
   }
 
-  // 4. Unités de mesure (un appel Odoo à la fois)
-  const uomSteps: Step<Uom | null>[] = [];
-  for (let i = 0; i < draft.lines.length; i++) {
-    uomSteps.push(await resolveUom(draft.lines[i], products[i], draft));
-  }
-  const uoms: (Uom | null)[] = [];
-  for (const step of uomSteps) {
-    if (!step.ok) return step.response;
-    uoms.push(step.value);
-  }
-
-  // 5. Commande interne (prix et total calculés par le serveur)
-  const order = buildOrder(
-    customer,
-    draft.lines.map((line, i) => ({
-      product: products[i],
-      quantity: line.quantity as number, // vérifié à l'étape 1
-      uom: uoms[i],
-    }))
-  );
-
-  return { type: "order_preview", order, draft };
+  return { type: "order_preview", order: buildOrder(customer, resolved), draft };
 }
 
 async function resolveCustomer(draft: Draft): Promise<Step<Customer>> {
@@ -216,13 +228,42 @@ async function resolveCustomer(draft: Draft): Promise<Step<Customer>> {
   });
 }
 
-async function resolveProduct(line: DraftLine, index: number, draft: Draft): Promise<Step<Product>> {
-  if (line.productId) {
-    const known = await getProductById(line.productId);
-    if (known) return ok(known);
-    line.productId = undefined;
-  }
+/**
+ * Résout toutes les lignes. Les produits déjà choisis sont vérifiés en UN appel groupé ;
+ * seules les lignes encore inconnues déclenchent une recherche (une par ligne, en série).
+ */
+async function resolveProducts(draft: Draft): Promise<Step<Product[]>> {
+  const known = await getProductsByIds(draft.lines.flatMap((l) => (l.productId ? [l.productId] : [])));
 
+  const products: (Product | null)[] = draft.lines.map((line) => {
+    if (!line.productId) return null;
+    const found = known.get(line.productId);
+    if (found) return found;
+    line.productId = undefined; // supprimé d'Odoo entre-temps → on recherche à nouveau
+    return null;
+  });
+
+  // Les lignes non résolues sont cherchées une par une (requêtes textuelles distinctes),
+  // en série pour ne pas envoyer de rafale à Odoo.
+  let firstFailure: ChatResponse | null = null;
+  for (let i = 0; i < draft.lines.length; i++) {
+    if (products[i]) continue;
+    const step = await searchProductForLine(draft.lines[i], i, draft);
+    if (step.ok) {
+      products[i] = step.value;
+      draft.lines[i].productId = step.value.id; // on garde les choix déjà faits
+    } else if (!firstFailure) {
+      firstFailure = step.response;
+    }
+  }
+  // On renvoie la première question seulement APRÈS avoir tenté toutes les lignes :
+  // les produits trouvés entre-temps sont mémorisés dans le brouillon.
+  if (firstFailure) return fail(firstFailure);
+
+  return ok(products as Product[]);
+}
+
+async function searchProductForLine(line: DraftLine, index: number, draft: Draft): Promise<Step<Product>> {
   const found = await searchProduct(line.productQuery);
 
   if (found.length === 0) {
@@ -238,27 +279,88 @@ async function resolveProduct(line: DraftLine, index: number, draft: Draft): Pro
     message: `J'ai trouvé plusieurs produits correspondant à « ${line.productQuery} ». Veuillez sélectionner le produit.`,
     candidates: found.map((p) => ({
       id: p.id,
-      label: p.name,
-      detail: p.listPrice != null ? formatMoney(p.listPrice, cfg.displayCurrency) : undefined,
+      label: p.label,
+      detail: p.listPrice != null ? `${formatMoney(p.listPrice, cfg.displayCurrency)} / ${p.uomName ?? "unité"}` : undefined,
     })),
     draft,
   });
 }
 
-async function resolveUom(line: DraftLine, product: Product, draft: Draft): Promise<Step<Uom | null>> {
-  // Pas d'unité dans le message → unité par défaut du produit
-  if (!line.uomQuery) {
-    return ok(product.uomId != null ? { id: product.uomId, name: product.uomName ?? "" } : null);
+/**
+ * Détermine sous quelle forme la quantité est exprimée.
+ *
+ * Règle : dès qu'un produit a des conditionnements, la quantité saisie les désigne
+ * (« 2 vanilles » = 2 bacs, pas 2 kg). S'il y en a plusieurs, on demande lequel.
+ * L'utilisateur peut toujours forcer l'unité de base en l'écrivant (« 10 kg de vanille »).
+ */
+async function resolveUnit(
+  line: DraftLine,
+  index: number,
+  product: Product,
+  packagings: Packaging[],
+  draft: Draft
+): Promise<Step<{ packaging: Packaging | null; uom: Uom | null }>> {
+  const baseUom = baseUomOf(product);
+
+  // Conditionnement déjà choisi → on vérifie qu'il appartient toujours à ce produit
+  if (line.packagingId) {
+    const chosen = packagings.find((p) => p.id === line.packagingId);
+    if (chosen) return ok({ packaging: chosen, uom: baseUom });
+    line.packagingId = undefined;
   }
 
-  const word = normalizeUom(line.uomQuery);
+  const askWhichPackaging = (options: Packaging[]): Step<never> =>
+    fail({
+      type: "selection",
+      kind: "packaging",
+      lineIndex: index,
+      message: `Sous quel conditionnement pour « ${product.label} » ?`,
+      candidates: options.map((p) => ({
+        id: p.id,
+        label: p.name,
+        detail: `${formatQty(p.qty)} ${product.uomName ?? ""}`.trim(),
+      })),
+      draft,
+    });
+
+  // Aucune unité écrite par l'utilisateur
+  if (!line.uomQuery) {
+    if (packagings.length === 0) return ok({ packaging: null, uom: baseUom });
+    if (packagings.length === 1) return ok({ packaging: packagings[0], uom: baseUom });
+    return askWhichPackaging(packagings);
+  }
+
+  // L'utilisateur a écrit l'unité de base (« 10 kg ») → pas de conditionnement
+  if (baseUom && baseUom.name && matchesAllWords(baseUom.name, line.uomQuery)) {
+    return ok({ packaging: null, uom: baseUom });
+  }
+
+  // L'utilisateur a écrit un conditionnement (« bacs », « bac 4kg »)
+  if (packagings.length > 0) {
+    const hits = packagings.filter((p) => matchesAllWords(p.name, line.uomQuery as string));
+    if (hits.length === 1) return ok({ packaging: hits[0], uom: baseUom });
+    // Rien ou trop de correspondances : on montre la liste plutôt que de deviner.
+    return askWhichPackaging(hits.length > 1 ? hits : packagings);
+  }
+
+  // Pas de conditionnement sur ce produit → ancienne logique uom.uom (1 appel)
+  return resolveUomByName(line, product, draft);
+}
+
+/** Produit sans conditionnement : on cherche l'unité dans uom.uom, comme avant. */
+async function resolveUomByName(
+  line: DraftLine,
+  product: Product,
+  draft: Draft
+): Promise<Step<{ packaging: null; uom: Uom | null }>> {
+  const word = normalizeUom(line.uomQuery as string);
   const term = cfg.uom.aliases[word] ?? word; // alias configurable dans odoo-config.ts
   const found = await searchUom(term);
 
   if (found.length === 0) {
     return fail(
       clarify(
-        `Je n'ai pas trouvé l'unité « ${line.uomQuery} » dans Odoo (produit : ${product.name}). Précisez l'unité, par exemple « ${product.uomName ?? "Unité"} ».`,
+        `Je n'ai pas trouvé l'unité « ${line.uomQuery} » dans Odoo (produit : ${product.label}). Précisez l'unité, par exemple « ${product.uomName ?? "Unité"} ».`,
         draft
       )
     );
@@ -267,7 +369,7 @@ async function resolveUom(line: DraftLine, product: Product, draft: Draft): Prom
     found.map((u) => ({ ...u, name: normalizeUom(u.name) })),
     normalizeUom(term)
   );
-  if (one) return ok(found.find((u) => u.id === one.id) ?? null);
+  if (one) return ok({ packaging: null, uom: found.find((u) => u.id === one.id) ?? null });
 
   return fail(
     clarify(
@@ -278,17 +380,22 @@ async function resolveUom(line: DraftLine, product: Product, draft: Draft): Prom
 }
 
 /** Construit la commande interne. Aucun prix n'est inventé : null = "calculé par Odoo". */
-function buildOrder(customer: Customer, items: { product: Product; quantity: number; uom: Uom | null }[]): Order {
-  const lines = items.map(({ product, quantity, uom }) => {
+function buildOrder(customer: Customer, items: ResolvedLine[]): Order {
+  const lines = items.map((item) => {
+    const { product, quantity, packaging, uom } = item;
+    const baseQuantity = baseQuantityOf(item);
     const unitPrice = cfg.getPreviewUnitPrice(product, uom?.id ?? null);
     return {
       productId: product.id,
-      productName: product.name,
+      productName: product.label,
       quantity,
+      packagingId: packaging?.id ?? null,
+      packagingName: packaging?.name ?? null,
+      baseQuantity,
       uomId: uom?.id ?? null,
       uomName: uom?.name ?? null,
       unitPrice,
-      subtotal: unitPrice == null ? null : round2(unitPrice * quantity),
+      subtotal: unitPrice == null ? null : round2(unitPrice * baseQuantity),
     };
   });
 
@@ -306,8 +413,12 @@ function buildOrder(customer: Customer, items: { product: Product; quantity: num
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Revalide TOUT auprès d'Odoo (client, produits, unités existent toujours),
- * puis crée le Sales Order. Le navigateur ne fournit que des IDs et des quantités.
+ * Revalide TOUT auprès d'Odoo (client, produits, conditionnements, unités existent
+ * toujours), puis crée le Sales Order. Le navigateur ne fournit que des IDs et des
+ * quantités ; la conversion conditionnement → unité de base est REFAITE ici depuis
+ * la fiche Odoo, jamais reprise du navigateur.
+ *
+ * Coût : 4 lectures groupées, quel que soit le nombre de lignes.
  */
 export async function confirmOrder(body: unknown): Promise<ConfirmResponse> {
   const request = sanitizeOrderRequest(body);
@@ -316,19 +427,38 @@ export async function confirmOrder(body: unknown): Promise<ConfirmResponse> {
   const customer = await getCustomerById(request.customerId);
   if (!customer) throw gone;
 
-  const items = await Promise.all(
-    request.lines.map(async (line) => {
-      const product = await getProductById(line.productId);
-      if (!product) throw gone;
-      const uom = line.uomId ? await getUomById(line.uomId) : null;
-      if (line.uomId && !uom) throw gone;
-      return { product, quantity: line.quantity, uom };
-    })
-  );
-  buildOrder(customer, items); // même construction que le preview (cohérence)
+  const products = await getProductsByIds(request.lines.map((l) => l.productId));
+  const packagings = await getPackagingsByIds(request.lines.flatMap((l) => (l.packagingId ? [l.packagingId] : [])));
+  const uoms = await getUomsByIds(request.lines.flatMap((l) => (l.uomId ? [l.uomId] : [])));
+
+  const lines: NewOrderLine[] = request.lines.map((line) => {
+    const product = products.get(line.productId);
+    if (!product) throw gone;
+    if (line.uomId && !uoms.has(line.uomId)) throw gone;
+
+    let packaging: Packaging | null = null;
+    if (line.packagingId) {
+      packaging = packagings.get(line.packagingId) ?? null;
+      // Un conditionnement d'un AUTRE produit n'est pas recevable.
+      if (!packaging || packaging.productId !== product.id) throw gone;
+    }
+
+    const baseQuantity = roundQty(packaging ? line.quantity * packaging.qty : line.quantity);
+    if (!isValidQuantity(baseQuantity)) {
+      throw new AppError("Une quantité est invalide (elle doit être supérieure à zéro).", "invalid_quantity");
+    }
+
+    return {
+      productId: product.id,
+      baseQuantity,
+      uomId: line.uomId,
+      packagingId: packaging?.id ?? null,
+      packagingQty: packaging ? line.quantity : null,
+    };
+  });
 
   // ↓ Seul endroit du projet où l'on écrit dans Odoo.
-  const created = await createSalesOrder(request);
+  const created = await createSalesOrder(customer.id, lines);
 
   return {
     success: true,

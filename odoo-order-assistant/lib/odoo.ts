@@ -9,11 +9,15 @@
  *     sale.order  / create       → { "vals_list": [ {...} ] }
  *     sale.order  / action_confirm → { "ids": [12] }
  *
+ * Les lectures par ID sont GROUPÉES (`["id", "in", [...]]`) : une commande de
+ * N lignes coûte un nombre d'appels constant, pas N. Voir order-service.ts.
+ *
  * Ce fichier ne s'exécute que côté serveur (la clé API n'atteint jamais le navigateur).
  */
 import { AppError } from "./errors";
-import { odooConfig as cfg } from "./odoo-config";
-import type { Customer, OrderRequest, Product, Uom } from "@/types/order";
+import { odooConfig as cfg, type NewOrderLine } from "./odoo-config";
+import { singular, words } from "./text";
+import type { Customer, Packaging, Product, Uom } from "@/types/order";
 
 const TIMEOUT_MS = 15_000;
 
@@ -63,14 +67,14 @@ async function odooCall<T>(model: string, method: string, params: Record<string,
   }
 
   if (!res.ok) {
-    // `text()` conserve la réponse telle qu'Odoo l'a envoyée, qu'elle soit JSON ou texte.
-    // Journal serveur temporaire de diagnostic ; ne jamais inclure l'en-tête Authorization.
-    const body = await res.text();
-    console.error(`[odoo] ${model}.${method} → HTTP ${res.status} — réponse complète :`, body);
+    // Statut et modèle seulement : le corps d'une erreur Odoo peut contenir
+    // des données d'enregistrement, qui n'ont rien à faire dans les logs.
+    console.error(`[odoo] ${model}.${method} → HTTP ${res.status}`);
 
     if (res.status === 401) throw new AppError("La clé API Odoo est invalide ou expirée.", "odoo_auth", 502);
     if (res.status === 403) throw new AppError("Le compte Odoo n'a pas les droits nécessaires pour cette opération.", "odoo_forbidden", 502);
     if (res.status === 404) throw new AppError("L'API JSON-2 d'Odoo est introuvable (vérifiez ODOO_URL) ou le modèle n'existe pas.", "odoo_not_found", 502);
+    if (res.status === 429) throw new AppError("Odoo limite le nombre de requêtes. Réessayez dans un instant.", "odoo_rate_limited", 502);
     throw new AppError("Odoo a refusé l'opération.", "odoo_error", 502);
   }
 
@@ -94,16 +98,19 @@ function m2o(v: unknown): { id: number; name: string | null } | null {
 /**
  * Construit un domaine Odoo : chaque MOT du texte doit se trouver dans l'un des champs.
  * "Coca 33cl" → trouve "Coca-Cola 33cl" (mots "Coca" ET "33cl").
+ *
+ * Les mots sont mis au singulier : « 2 vanilles » doit trouver « Gelato Vanille ».
+ * Comme Odoo fait un `ilike` (sous-chaîne), retirer le « s » ne peut qu'élargir.
  */
 export function buildNameDomain(fields: string[], query: string): unknown[] {
-  const words = query.split(/[\s,;]+/).filter(Boolean);
-  if (words.length === 0) throw new AppError("La recherche est vide.", "empty_query");
+  const terms = words(query).map(singular);
+  if (terms.length === 0) throw new AppError("La recherche est vide.", "empty_query");
 
   const domain: unknown[] = [];
-  for (const word of words) {
+  for (const term of terms) {
     // Pour N champs : N-1 opérateurs "|" (OU) puis les N conditions.
     for (let i = 1; i < fields.length; i++) domain.push("|");
-    for (const field of fields) domain.push([field, "ilike", word]);
+    for (const field of fields) domain.push([field, "ilike", term]);
   }
   return domain;
 }
@@ -121,6 +128,16 @@ async function searchRead(
   return Array.isArray(rows) ? (rows as Row[]) : [];
 }
 
+/** Lecture groupée par IDs : UN appel quel que soit le nombre d'IDs. */
+async function readByIds(model: string, ids: number[], fields: string[], extraDomain: unknown[] = []): Promise<Row[]> {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return [];
+  return searchRead(model, [["id", "in", unique], ...extraDomain], fields, unique.length);
+}
+
+const indexById = <T extends { id: number }>(items: T[]): Map<number, T> =>
+  new Map(items.map((item) => [item.id, item]));
+
 // ─────────────────────────────────────────────────────────────────────
 // Transformation des enregistrements Odoo
 // ─────────────────────────────────────────────────────────────────────
@@ -133,10 +150,17 @@ function toCustomer(row: Row): Customer {
 function toProduct(row: Row): Product {
   const id = asNumber(row.id) ?? 0;
   const uom = m2o(row.uom_id);
+  const name = asString(row.name) ?? asString(row.display_name) ?? `Produit #${id}`;
+  const code = asString(row.default_code);
+  // Odoo préfixe display_name par "[REF] ". Utile dans Odoo, du bruit pour un
+  // commercial qui choisit dans une liste — on retire ce préfixe précis, et rien d'autre.
+  const display = asString(row.display_name) ?? name;
+  const label = code && display.startsWith(`[${code}] `) ? display.slice(code.length + 3) : display;
   return {
     id,
-    name: asString(row.display_name) ?? asString(row.name) ?? `Produit #${id}`,
-    code: asString(row.default_code),
+    name,
+    label,
+    code,
     listPrice: asNumber(row.lst_price),
     uomId: uom?.id ?? null,
     uomName: uom?.name ?? null,
@@ -148,8 +172,18 @@ function toUom(row: Row): Uom {
   return { id, name: asString(row.name) ?? `Unité #${id}` };
 }
 
+function toPackaging(row: Row): Packaging {
+  const id = asNumber(row.id) ?? 0;
+  return {
+    id,
+    name: asString(row.name) ?? `Conditionnement #${id}`,
+    qty: asNumber(row.qty) ?? 0,
+    productId: m2o(row.product_id)?.id ?? 0,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────
-// Recherches
+// Clients
 // ─────────────────────────────────────────────────────────────────────
 
 export async function searchCustomer(query: string): Promise<Customer[]> {
@@ -161,9 +195,13 @@ export async function searchCustomer(query: string): Promise<Customer[]> {
 
 export async function getCustomerById(id: number): Promise<Customer | null> {
   const c = cfg.customer;
-  const rows = await searchRead(c.model, [["id", "=", id], ...c.extraDomain], c.fields, 1);
+  const rows = await readByIds(c.model, [id], c.fields, c.extraDomain);
   return rows.length ? toCustomer(rows[0]) : null;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Produits
+// ─────────────────────────────────────────────────────────────────────
 
 export async function searchProduct(query: string): Promise<Product[]> {
   const p = cfg.product;
@@ -172,11 +210,53 @@ export async function searchProduct(query: string): Promise<Product[]> {
   return rows.map(toProduct);
 }
 
-export async function getProductById(id: number): Promise<Product | null> {
+/** Vérifie plusieurs produits en UN appel. Les IDs absents du résultat n'existent plus. */
+export async function getProductsByIds(ids: number[]): Promise<Map<number, Product>> {
   const p = cfg.product;
-  const rows = await searchRead(p.model, [["id", "=", id], ...p.extraDomain], p.fields, 1);
-  return rows.length ? toProduct(rows[0]) : null;
+  const rows = await readByIds(p.model, ids, p.fields, p.extraDomain);
+  return indexById(rows.map(toProduct));
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Conditionnements (product.packaging)
+// ─────────────────────────────────────────────────────────────────────
+
+/** Tous les conditionnements des produits donnés, en UN appel, groupés par produit. */
+export async function getPackagingsForProducts(productIds: number[]): Promise<Map<number, Packaging[]>> {
+  const byProduct = new Map<number, Packaging[]>();
+  const unique = [...new Set(productIds)];
+  if (!cfg.packaging.enabled || unique.length === 0) return byProduct;
+
+  const pk = cfg.packaging;
+  const rows = await searchRead(
+    pk.model,
+    [["product_id", "in", unique], ...pk.extraDomain],
+    pk.fields,
+    unique.length * cfg.searchLimit,
+    "qty asc"
+  );
+
+  for (const packaging of rows.map(toPackaging)) {
+    // Un conditionnement sans quantité utilisable ne permet aucune conversion.
+    if (packaging.qty <= 0) continue;
+    const list = byProduct.get(packaging.productId);
+    if (list) list.push(packaging);
+    else byProduct.set(packaging.productId, [packaging]);
+  }
+  return byProduct;
+}
+
+/** Vérifie plusieurs conditionnements en UN appel (revalidation avant création). */
+export async function getPackagingsByIds(ids: number[]): Promise<Map<number, Packaging>> {
+  if (!cfg.packaging.enabled) return new Map();
+  const pk = cfg.packaging;
+  const rows = await readByIds(pk.model, ids, pk.fields, pk.extraDomain);
+  return indexById(rows.map(toPackaging).filter((p) => p.qty > 0));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Unités de mesure
+// ─────────────────────────────────────────────────────────────────────
 
 export async function searchUom(query: string): Promise<Uom[]> {
   const u = cfg.uom;
@@ -184,10 +264,11 @@ export async function searchUom(query: string): Promise<Uom[]> {
   return rows.map(toUom);
 }
 
-export async function getUomById(id: number): Promise<Uom | null> {
+/** Vérifie plusieurs unités en UN appel. */
+export async function getUomsByIds(ids: number[]): Promise<Map<number, Uom>> {
   const u = cfg.uom;
-  const rows = await searchRead(u.model, [["id", "=", id]], u.fields, 1);
-  return rows.length ? toUom(rows[0]) : null;
+  const rows = await readByIds(u.model, ids, u.fields);
+  return indexById(rows.map(toUom));
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -206,11 +287,11 @@ export interface CreatedOrder {
 /**
  * Crée le devis dans Odoo (et le confirme si ORDER_CREATION_MODE=create_and_confirm).
  * À n'appeler qu'APRÈS confirmation explicite de l'utilisateur.
- * `orderData` doit déjà avoir été revalidé auprès d'Odoo (voir order-service.ts).
+ * `lines` doit déjà avoir été revalidé auprès d'Odoo (voir order-service.ts).
  */
-export async function createSalesOrder(orderData: OrderRequest): Promise<CreatedOrder> {
+export async function createSalesOrder(customerId: number, lines: NewOrderLine[]): Promise<CreatedOrder> {
   const so = cfg.salesOrder;
-  const values = so.buildOrderValues(orderData.customerId, orderData.lines);
+  const values = so.buildOrderValues(customerId, lines);
 
   const created = await odooCall<unknown>(so.model, "create", { vals_list: [values] });
   const id = Array.isArray(created) ? asNumber(created[0]) : asNumber(created);

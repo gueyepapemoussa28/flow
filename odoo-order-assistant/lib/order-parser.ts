@@ -32,8 +32,10 @@ const same = (a: string | null | undefined, b: string | null | undefined) =>
 
 /**
  * Transforme la réponse de Gemini en brouillon.
- * Si l'utilisateur avait déjà choisi un client / un produit dans une liste et que
- * le texte n'a pas changé, on garde ce choix (il n'a pas à le refaire).
+ * Si l'utilisateur avait déjà choisi un client / un produit / un conditionnement
+ * dans une liste et que le texte n'a pas changé, on garde ce choix (il n'a pas à
+ * le refaire). Le conditionnement n'est conservé que si le produit ET l'unité
+ * écrite sont inchangés — sinon le choix ne veut plus rien dire.
  */
 export function mergeIntoDraft(parsed: ParsedMessage, previous: Draft | null): Draft {
   const customerQuery = parsed.customer_query ?? previous?.customerQuery ?? null;
@@ -45,11 +47,14 @@ export function mergeIntoDraft(parsed: ParsedMessage, previous: Draft | null): D
   } else {
     lines = parsed.lines.map((l, i) => {
       const before = previous?.lines[i];
+      const sameProduct = before !== undefined && same(before.productQuery, l.product_query);
+      const sameUnit = before !== undefined && same(before.uomQuery, l.uom_query);
       return {
         productQuery: l.product_query,
         quantity: l.quantity,
         uomQuery: l.uom_query,
-        productId: before && same(before.productQuery, l.product_query) ? before.productId : undefined,
+        productId: sameProduct ? before.productId : undefined,
+        packagingId: sameProduct && sameUnit ? before.packagingId : undefined,
       };
     });
   }

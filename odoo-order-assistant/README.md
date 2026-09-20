@@ -115,6 +115,28 @@ curl -s -X POST "https://monclient.odoo.com/json/2/product.product/search_read" 
 ```
 
 Vous devez voir `display_name`, `lst_price` (prix de vente) et `uom_id` (unité du produit).
+`name` est le nom nu, `display_name` le nom préfixé par la référence (`[COCA33] Coca-Cola 33cl`) :
+l'app cherche sur `name` et affiche `display_name` débarrassé de son préfixe.
+
+**Test n° 2 bis — les conditionnements** (⚠ à faire si vos produits se vendent au kg / au litre) :
+
+```bash
+curl -s -X POST "https://monclient.odoo.com/json/2/product.packaging/search_read" \
+  -H "Authorization: bearer VOTRE_CLE_API" \
+  -H "Content-Type: application/json" \
+  -d '{"domain":[],"fields":["name","qty","product_id"],"limit":5}'
+```
+
+Vous devez voir vos bacs / cartons, avec `qty` = nombre d'unités de base par conditionnement
+(« Bac 4 kg » → `qty: 4` pour un produit vendu au kg).
+
+- Une liste → rien à faire, la configuration par défaut convient.
+- `404` ou modèle inconnu → votre base n'utilise pas `product.packaging` : mettez
+  `packaging.enabled: false` dans `lib/odoo-config.ts` (les quantités seront alors
+  interprétées dans l'unité de base du produit).
+- Des champs différents → corrigez `packaging.model` / `packaging.fields` dans `lib/odoo-config.ts`.
+- Liste vide → activez *Ventes → Configuration → Conditionnements de produit*, puis
+  renseignez l'onglet « Conditionnements » de vos fiches produit.
 
 **Test n° 3 — dans l'application**, avec de vrais noms :
 
@@ -125,11 +147,15 @@ Vous devez voir `display_name`, `lst_price` (prix de vente) et `uom_id` (unité 
 | `Commande ABC avec Coca.` | « Quelle quantité… ? » |
 | Un client qui n'existe pas | « Je n'ai trouvé aucun client correspondant à … » |
 | `Coca` (plusieurs produits) | Liste de choix cliquable |
+| `2 vanilles` (pluriel) | Le produit est trouvé malgré le « s » |
+| `2 vanille` (produit au kg, 2 conditionnements) | « Sous quel conditionnement ? » → Bac 4 kg / Bac 5 kg |
+| `2 bacs de 4kg de vanille` | Preview direct : 2 bacs, **soit 8 kg** |
+| `10 kg de vanille` | Preview en unité de base, sans conditionnement |
 | `-5 Fanta` | Refus (« doit être un nombre supérieur à zéro ») |
 | Clic sur **Annuler** | Aucune création dans Odoo |
 | Clic sur **Confirmer** | Devis créé ; l'app affiche son numéro (ex. `S00045`) — **vérifiez-le dans Odoo → Ventes** |
 
-Les erreurs détaillées (réponse d'Odoo, statut HTTP) sont écrites dans les **logs du serveur** (terminal en local, *Logs* dans Vercel), jamais dans l'interface.
+Les erreurs (modèle appelé, statut HTTP) sont écrites dans les **logs du serveur** (terminal en local, *Logs* dans Vercel), jamais dans l'interface. Le corps des réponses d'Odoo n'est pas journalisé : il peut contenir des données d'enregistrement.
 
 ## 8. Vercel
 
@@ -160,10 +186,11 @@ Autres limites connues du MVP : pas de protection contre le double envoi si la c
 |---|---|---|---|
 | **Clients** | `customer.model`, `fields`, `searchFields`, `extraDomain` | `res.partner`, recherche sur `name` | Filtrer les clients (ex. `[["customer_rank",">",0]]`, `[["is_company","=",true]]`), chercher aussi sur un code client |
 | **Produits** | `product.model`, `fields`, `searchFields`, `extraDomain` | `product.product`, recherche sur `name` + `default_code`, `sale_ok = true` | Produits vendables, filtre par catégorie, variantes |
-| **Unités de mesure** | `uom.model`, `uom.aliases` | `uom.uom`, recherche par nom | Alias métier : `caisse: "Carton"`. Si vos « cartons » sont des **conditionnements** (`product.packaging`) et non des UdM, il faut adapter `resolveUom` (`lib/order-service.ts`) et `buildLineValues` |
-| **Prix affiché (preview)** | `getPreviewUnitPrice()` | Prix de vente (`lst_price`) si l'unité = celle du produit, sinon « Prix calculé par Odoo » | Vos listes de prix, prix par carton (facteur de conversion). Le vrai prix est **toujours** calculé par Odoo à la création |
+| **Conditionnements** | `packaging.enabled`, `model`, `fields`, `extraDomain` | `product.packaging`, champs `name` / `qty` / `product_id` | **À vérifier en premier** (test n° 2 bis). `enabled: false` si votre base n'en utilise pas. `extraDomain: [["sales","=",true]]` pour ne garder que ceux de la vente |
+| **Unités de mesure** | `uom.model`, `uom.aliases` | `uom.uom`, recherche par nom | Alias métier : `caisse: "Carton"`. Utilisé seulement pour les produits **sans** conditionnement |
+| **Prix affiché (preview)** | `getPreviewUnitPrice()` | Prix de vente (`lst_price`) × quantité **de base** | Vos listes de prix. Le vrai prix est **toujours** calculé par Odoo à la création |
 | **Liste de prix** | variable `ODOO_PRICELIST_ID` | celle du client | Imposer une liste précise |
-| **Ligne de commande** | `salesOrder.buildLineValues()` | `product_id`, `product_uom_qty`, `product_uom_id` | ⚠ Sur Odoo 19 le champ d'unité est `product_uom_id` (`product_uom` avant). Ajouter taxes, remise, etc. si nécessaire |
+| **Ligne de commande** | `salesOrder.buildLineValues()` | `product_id`, `product_uom_qty` (en unité de base), `product_uom_id`, `product_packaging_id` + `product_packaging_qty` | ⚠ Sur Odoo 19 le champ d'unité est `product_uom_id` (`product_uom` avant). Ajouter taxes, remise, etc. si nécessaire |
 | **Création du Sales Order** | `salesOrder.buildOrderValues()` | `partner_id`, `order_line`, `origin`, `pricelist_id` (optionnel) | Entrepôt, équipe commerciale, note, conditions de paiement… |
 | **Devis vs commande** | variable `ORDER_CREATION_MODE` | `create_only` (devis) | `create_and_confirm` appelle `action_confirm` |
 | **Devise affichée** | `displayCurrency` | `XOF` | `XAF` pour la zone CEMAC |
@@ -171,12 +198,13 @@ Autres limites connues du MVP : pas de protection contre le double envoi si la c
 Où se trouve quoi :
 
 ```
-app/api/chat/route.ts              POST /api/chat            (message, sélection client/produit)
+app/api/chat/route.ts              POST /api/chat            (message, sélection client/produit/conditionnement)
 app/api/orders/confirm/route.ts    POST /api/orders/confirm  (création dans Odoo)
 lib/gemini.ts                      prompt système + appel Gemini (JSON structuré)
 lib/order-parser.ts                message → intention + brouillon (raccourcis « oui » / « annule » sans IA)
-lib/order-service.ts               logique métier : résolution client/produit/unité, preview, confirmation
-lib/odoo.ts                        TOUS les appels à l'API JSON-2 d'Odoo
+lib/order-service.ts               logique métier : résolution client/produit/conditionnement, preview, confirmation
+lib/text.ts                        appariement du texte libre (pluriel, mots de liaison)
+lib/odoo.ts                        TOUS les appels à l'API JSON-2 d'Odoo (lectures groupées par IDs)
 lib/odoo-config.ts                 ← ce que vous adaptez
 lib/validation.ts                  validation de tout ce qui entre (Gemini + navigateur)
 components/                        interface (Chat, MessageList, ChatInput, OrderPreview, SelectionMessage)
@@ -186,13 +214,15 @@ tests/run-tests.mts                tests automatiques (Gemini et Odoo simulés)
 ## Comment l'app gère les cas délicats
 
 - **Plusieurs clients / produits** correspondent → liste cliquable, jamais de choix automatique (sauf si un seul nom correspond *exactement* au texte saisi).
-- **Recherche** : chaque mot du texte doit se trouver dans le nom (« Coca 33cl » trouve « Coca-Cola 33cl »).
+- **Recherche** : chaque mot du texte doit se trouver dans le nom (« Coca 33cl » trouve « Coca-Cola 33cl »). Les pluriels et les mots de liaison sont absorbés : « 2 vanilles », « bac de 4kg ».
 - **Quantité manquante ou invalide** (0, négative, non numérique) → l'app la redemande, sans appeler Odoo.
-- **Unité introuvable** → l'app le dit et propose l'unité par défaut du produit. Sans unité dans le message, l'unité du produit est utilisée.
+- **Conditionnements** : dès qu'un produit en a, la quantité saisie les désigne (« 2 vanille » = 2 bacs, jamais 2 kg). S'il y en a plusieurs, l'app demande lequel ; s'il n'y en a qu'un, elle le prend. L'utilisateur peut forcer l'unité de base en l'écrivant (« 10 kg de vanille »). Le preview affiche toujours la conversion (« 2 × Gelato Vanille — Bac 4 kg · soit 8 kg »).
+- **Unité introuvable** (produit sans conditionnement) → l'app le dit et propose l'unité par défaut du produit.
 - **Correction en cours de route** (« mets plutôt 12 », « ajoute 3 Sprite ») → le brouillon est renvoyé à Gemini (toujours 1 seul appel) qui le met à jour.
-- **Confirmation** : le navigateur n'envoie que des IDs et des quantités ; le serveur relit client, produits et unités dans Odoo avant de créer. Noms et prix venant du navigateur sont ignorés.
+- **Confirmation** : le navigateur n'envoie que des IDs et des quantités ; le serveur relit client, produits, conditionnements et unités dans Odoo avant de créer. Noms, prix et conversions venant du navigateur sont ignorés — la quantité envoyée à Odoo est recalculée depuis la fiche du conditionnement.
+- **Coût Odoo** : les lectures par ID sont groupées (`id in [...]`). Un brouillon déjà résolu coûte 3 appels et une confirmation 4, quel que soit le nombre de lignes, et jamais en rafale (le rate limit d'Odoo n'est pas déclenché).
 - **Erreurs** : messages compréhensibles en français, détails techniques dans les logs serveur uniquement.
 
 ## Étapes suivantes possibles
 
-Authentification · liste de prix par client · recherche floue (fautes de frappe) · historique des commandes créées · intégration n8n · autres documents (devis, bons de livraison).
+Authentification · liste de prix par client · recherche floue (fautes de frappe, accents) · historique des commandes créées · intégration n8n · autres documents (devis, bons de livraison).
